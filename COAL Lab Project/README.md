@@ -8,6 +8,7 @@ A Classic Arcade Game Built in x86 Assembly Language
   MASM x86 • Irvine32 Library
 </p>---
 
+
 🎮 About The Project
 
 Brick Breaker is a classic arcade-style game developed entirely in x86 Assembly Language using MASM and the Irvine32 library.
