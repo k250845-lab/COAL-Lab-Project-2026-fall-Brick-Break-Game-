@@ -1,0 +1,1384 @@
+; ============================================================
+;  BRICK BREAKER  -  MASM x86 / Irvine32
+;  EL-2003 Computer Organization & Assembly Language Lab
+; ------------------------------------------------------------
+;  Controls : LEFT/RIGHT (or A / D) move the paddle, ESC quits
+;  Features : 3 levels, 3 difficulties, colour themes, player
+;             name, TOP-5 leaderboard saved in leaderboard.dat,
+;             game stays centred in the console (also in full
+;             screen; re-centres live when the window changes).
+; ------------------------------------------------------------
+;  Everything is drawn on a virtual 80x25 canvas; GotoXYo adds
+;  the centring offset (offX, offY) to every position.
+;     row 0 HUD | row 1 top border | rows 4..7 bricks
+;     row 23 paddle | row 24 pit | cols 9/70 side borders
+; ============================================================
+
+INCLUDE Irvine32.inc
+
+; ---------------- Constants ----------------
+CANVAS_W     = 80          ; virtual canvas size
+CANVAS_H     = 25
+LEFT_X       = 10          ; playfield columns LEFT_X..RIGHT_X
+RIGHT_X      = 69
+TOP_Y        = 2           ; first playfield row
+PADDLE_Y     = 23
+PADDLE_STEP  = 2           ; cells moved per key press
+BRICK_ROWS   = 4
+BRICK_COLS   = 12
+BRICK_W      = 5           ; 4 visible blocks + 1 gap
+BRICK_TOP    = 4           ; canvas row of the first brick row
+TOTAL_BRICKS = BRICK_ROWS * BRICK_COLS
+MIN_DELAY    = 25          ; fastest frame time (ms)
+MAX_LEVEL    = 3
+LEVEL_STEP   = 10          ; ms faster per level
+LEVEL_BONUS  = 100
+LB_COUNT     = 5           ; leaderboard entries
+NAME_SLOT    = 13          ; 12 letters + 0
+NAME_MAX     = 12
+LB_BYTES     = LB_COUNT * NAME_SLOT + LB_COUNT * 4
+KEY_LEFT     = 25h         ; virtual-key codes
+KEY_RIGHT    = 27h
+KEY_ESC      = 1Bh
+KEY_A        = 41h
+KEY_D        = 44h
+
+; ---------------- Repeated instructions (macros expanded) ----------------
+.data
+bricks      BYTE TOTAL_BRICKS DUP(1)     ; 1 = brick alive, 0 = broken
+
+; Brick layouts, 48 bytes per level (4 rows x 12 columns)
+layouts     BYTE 1,1,1,1,1,1,1,1,1,1,1,1      ; level 1: full wall
+            BYTE 1,1,1,1,1,1,1,1,1,1,1,1
+            BYTE 1,1,1,1,1,1,1,1,1,1,1,1
+            BYTE 1,1,1,1,1,1,1,1,1,1,1,1
+            BYTE 1,1,1,1,1,1,1,1,1,1,1,1      ; level 2: striped
+            BYTE 1,0,1,0,1,0,1,0,1,0,1,0
+            BYTE 0,1,0,1,0,1,0,1,0,1,0,1
+            BYTE 1,1,1,1,1,1,1,1,1,1,1,1
+            BYTE 1,1,1,1,1,1,1,1,1,1,1,1      ; level 3: holes
+            BYTE 1,1,0,1,1,1,1,1,1,0,1,1
+            BYTE 1,0,1,1,0,1,1,0,1,1,0,1
+            BYTE 1,1,1,0,1,1,1,1,0,1,1,1
+
+; Colour themes (4 brick-row colours per level) and border colours
+levelColors BYTE lightRed,     yellow,    lightGreen, lightCyan
+            BYTE lightMagenta, lightRed,  yellow,     lightGreen
+            BYTE white,        lightCyan, lightBlue,  lightMagenta
+frameColors BYTE lightBlue, cyan, red
+
+; Difficulty tables: index 0 = Easy, 1 = Medium, 2 = Hard
+diffLives   DWORD 5, 3, 2                ; starting lives
+diffDelay   DWORD 85, 70, 55             ; ms per frame on level 1
+diffPaddle  DWORD 11, 9, 7               ; paddle width
+diffMult    DWORD 1, 2, 3                ; score multiplier
+diffColors  BYTE lightGreen, yellow, lightRed
+strEasy     BYTE "EASY  ",0
+strMed      BYTE "MEDIUM",0
+strHard     BYTE "HARD  ",0
+diffNameTbl DWORD OFFSET strEasy, OFFSET strMed, OFFSET strHard
+
+; End-screen tables, index = gameState - 1 (lost, won, quit)
+endColors   BYTE lightRed, lightGreen, lightGray
+endMsgTbl   DWORD OFFSET msgLose, OFFSET msgWin, OFFSET msgQuit
+
+; ---------------- Game state ----------------
+ballX       SDWORD ?
+ballY       SDWORD ?
+ballDX      SDWORD 1                     ; direction +1 / -1
+ballDY      SDWORD -1
+newX        SDWORD ?                     ; candidate next position
+newY        SDWORD ?
+paddleX     SDWORD ?
+paddleW     SDWORD 9                     ; set from the difficulty
+difficulty  DWORD 1                      ; 0 easy, 1 medium, 2 hard
+score       DWORD 0
+level       DWORD 1
+lives       DWORD 3
+bricksLeft  DWORD TOTAL_BRICKS
+frameDelay  DWORD 70
+lastBonus   DWORD 0
+gameState   DWORD 0                      ; 0 playing, 1 lost, 2 won, 3 quit, 4 level cleared
+keyVK       WORD 0
+
+; ---------------- Console / centring ----------------
+hOut        DWORD ?
+csbi        CONSOLE_SCREEN_BUFFER_INFO <>
+cursorInfo  CONSOLE_CURSOR_INFO <20,0>
+offX        SDWORD 0                     ; centring offsets
+offY        SDWORD 0
+winW        SDWORD 0                     ; current window size
+winH        SDWORD 0
+knownW      SDWORD 0                     ; window size the screen was drawn for
+knownH      SDWORD 0
+
+; ---------------- Player + leaderboard ----------------
+playerName  BYTE NAME_SLOT DUP(0)
+defaultName BYTE "PLAYER",0
+lastRank    SDWORD -1                    ; rank of the latest game (-1 = none)
+lbTop       DWORD 0                      ; canvas row of the leaderboard heading
+fileHandle  DWORD ?
+lbFile      BYTE "leaderboard.dat",0
+lbData      LABEL BYTE                   ; saved to the file as one block
+lbNames     BYTE LB_COUNT * NAME_SLOT DUP(0)
+lbScores    DWORD LB_COUNT DUP(0)
+
+; ---------------- Messages ----------------
+msgT1       BYTE "==============================",0
+msgT2       BYTE "        BRICK  BREAKER        ",0
+msgI1       BYTE "LEFT / RIGHT  or  A / D  : move paddle",0
+msgI2       BYTE "ESC                      : quit game",0
+msgI3       BYTE "Clear all 3 levels. Don't drop the ball!",0
+msgM1       BYTE "[ENTER]  Play",0
+msgM2       BYTE "[L]      Leaderboard",0
+msgM3       BYTE "[ESC]    Exit",0
+msgAskName  BYTE "ENTER YOUR NAME (max 12 letters):",0
+msgDiffTitle BYTE "SELECT DIFFICULTY",0
+msgEasy     BYTE "[1]  EASY    -  5 lives, wide paddle,   slow ball    x1 score",0
+msgMed      BYTE "[2]  MEDIUM  -  3 lives, normal paddle, normal speed x2 score",0
+msgHard     BYTE "[3]  HARD    -  2 lives, small paddle,  fast ball    x3 score",0
+msgPick     BYTE "Press 1, 2 or 3",0
+msgLBTitle  BYTE "------ TOP 5 PLAYERS ------",0
+msgDash     BYTE "---",0
+msgAnyKey   BYTE "Press any key to go back...",0
+msgReset    BYTE "Press R to reset the leaderboard",0
+msgConfirm  BYTE "Delete ALL scores? (Y = yes, any other key = cancel)",0
+msgHudLv    BYTE "  Lv:",0
+msgHudSc    BYTE "  Score:",0
+msgHudLi    BYTE "  Lives:",0
+msgHudBr    BYTE "  Bricks:",0
+msgHudDf    BYTE "  ",0
+msgTail     BYTE "   ",0
+msgLevelNo  BYTE "LEVEL ",0
+msgLaunch   BYTE "Press any key to launch...",0
+msgBlank    BYTE 26 DUP(' '),0
+msgCleared  BYTE "*** LEVEL CLEARED! ***",0
+msgBonus    BYTE "Level bonus: +",0
+msgPoints   BYTE " points",0
+msgScoreLbl BYTE "Score: ",0
+msgNext     BYTE "Press any key for the next level...",0
+msgWin      BYTE "*** YOU WIN! All levels cleared! ***",0
+msgLose     BYTE "*** GAME OVER ***",0
+msgQuit     BYTE "Game quit.",0
+msgPlayer   BYTE "Player: ",0
+msgFinal    BYTE "Final score: ",0
+msgDiffLbl  BYTE "Difficulty: ",0
+msgHigh     BYTE "NEW HIGH SCORE!",0
+msgAgain    BYTE "Y = play again   D = change difficulty   N = main menu",0
+
+.code
+; ============================================================
+main PROC
+    call Randomize
+    call UpdateOffsets          ; also fetches the console handle
+    call HideCursor
+    call LoadLeaderboard
+
+MainMenu:
+    call ShowTitle              ; EAX: 1 play, 2 leaderboard, 0 exit
+    cmp  eax, 0
+    je   ExitGame
+    cmp  eax, 2
+    jne  StartPlay
+    call ShowLeaderboard
+    jmp  MainMenu
+
+StartPlay:
+    call AskName
+    call SelectDifficulty
+NewRound:
+    call NewGame
+
+GameLoop:
+    mov  eax, frameDelay
+    call Delay                  ; game speed
+    call CheckResize            ; keeps the game centred
+    call HandleInput
+    call MoveBall
+    call DrawHUD
+    cmp  gameState, 0
+    je   GameLoop
+    cmp  gameState, 4
+    jne  GameEnded
+    call LevelCleared           ; next level
+    jmp  GameLoop
+
+GameEnded:
+    call ShowEndScreen          ; EAX: 1 again, 2 menu, 3 change difficulty
+    cmp  eax, 1
+    je   NewRound
+    cmp  eax, 3
+    jne  MainMenu
+    call SelectDifficulty
+    jmp  NewRound
+
+ExitGame:
+    exit
+main ENDP
+
+; ============================================================
+;  CONSOLE / CENTRING HELPERS
+; ============================================================
+
+; ReadWindow : read console info, store the window size
+ReadWindow PROC
+    push ebx
+    INVOKE GetConsoleScreenBufferInfo, hOut, ADDR csbi
+    movsx eax, csbi.srWindow.Right
+    movsx ebx, csbi.srWindow.Left
+    sub  eax, ebx
+    inc  eax
+    mov  winW, eax
+    movsx eax, csbi.srWindow.Bottom
+    movsx ebx, csbi.srWindow.Top
+    sub  eax, ebx
+    inc  eax
+    mov  winH, eax
+    pop  ebx
+    ret
+ReadWindow ENDP
+
+; Center : EAX = window size, ECX = canvas size, EBX = window origin
+;          returns EAX = offset that centres the canvas
+Center PROC
+    sub  eax, ecx
+    sar  eax, 1                 ; (window - canvas) / 2
+    jns  CenterOk
+    xor  eax, eax               ; window smaller than canvas
+CenterOk:
+    add  eax, ebx
+    ret
+Center ENDP
+
+; UpdateOffsets : compute the centring offsets from the real window
+;                 size; shrinks the buffer to the window (no scroll
+;                 bars, no text re-flow when the size changes)
+UpdateOffsets PROC
+    push ebx
+    INVOKE GetStdHandle, STD_OUTPUT_HANDLE
+    mov  hOut, eax
+    call ReadWindow
+
+    movsx eax, csbi.dwSize.X    ; buffer already equals the window?
+    cmp  eax, winW
+    jne  FitBuffer
+    movsx eax, csbi.dwSize.Y
+    cmp  eax, winH
+    je   FitDone
+FitBuffer:
+    mov  eax, winH              ; COORD = (Y << 16) | X
+    shl  eax, 16
+    or   eax, winW
+    push eax
+    push hOut
+    call SetConsoleScreenBufferSize
+    call ReadWindow
+FitDone:
+    movsx ebx, csbi.srWindow.Left
+    mov  eax, winW
+    mov  ecx, CANVAS_W
+    call Center
+    mov  offX, eax
+    movsx ebx, csbi.srWindow.Top
+    mov  eax, winH
+    mov  ecx, CANVAS_H
+    call Center
+    mov  offY, eax
+    pop  ebx
+    ret
+UpdateOffsets ENDP
+
+; GotoXYo : Gotoxy with CANVAS coordinates (DL = col, DH = row)
+GotoXYo PROC
+    push eax
+    push edx
+    movzx eax, dl
+    add  eax, offX
+    mov  dl, al
+    movzx eax, dh
+    add  eax, offY
+    mov  dh, al
+    call Gotoxy
+    pop  edx
+    pop  eax
+    ret
+GotoXYo ENDP
+
+; WindowChanged : EAX = 1 if the window size changed since the screen was drawn
+WindowChanged PROC
+    call UpdateOffsets
+    mov  eax, winW
+    cmp  eax, knownW
+    jne  WCYes
+    mov  eax, winH
+    cmp  eax, knownH
+    jne  WCYes
+    xor  eax, eax
+    ret
+WCYes:
+    mov  eax, 1
+    ret
+WindowChanged ENDP
+
+; NewScreen : re-centre, remember the window size, clear the console
+NewScreen PROC
+    call UpdateOffsets
+    mov  eax, winW
+    mov  knownW, eax
+    mov  eax, winH
+    mov  knownH, eax
+    call Clrscr
+    call HideCursor
+    ret
+NewScreen ENDP
+
+; RedrawScene : clear and redraw the whole game screen
+RedrawScene PROC
+    call NewScreen
+    call DrawFrame
+    call DrawBricks
+    mov  bl, 0DBh
+    call PaintPaddle
+    mov  bl, 'O'
+    call PaintBall
+    call DrawHUD
+    ret
+RedrawScene ENDP
+
+; CheckResize : redraw the game if the window size changed
+CheckResize PROC
+    call WindowChanged
+    test eax, eax
+    jz   NoResize
+    call RedrawScene
+NoResize:
+    ret
+CheckResize ENDP
+
+; WaitKey : wait for a key without freezing the layout.
+;   EAX = key (letters in UPPER case), or -1 if the window was
+;   resized meanwhile (the caller then redraws its screen).
+WaitKey PROC
+WKLoop:
+    mov  eax, 30
+    call Delay
+    call HideCursor
+    call WindowChanged
+    test eax, eax
+    jnz  WKResized
+    call ReadKey                ; ZF = 1 when no key
+    jz   WKLoop
+    movzx eax, al
+    cmp  al, 'a'
+    jb   WKDone
+    cmp  al, 'z'
+    ja   WKDone
+    sub  al, 20h                ; lower -> upper case
+WKDone:
+    ret
+WKResized:
+    mov  eax, -1
+    ret
+WaitKey ENDP
+
+HideCursor PROC
+    mov  cursorInfo.bVisible, 0
+    INVOKE SetConsoleCursorInfo, hOut, ADDR cursorInfo
+    ret
+HideCursor ENDP
+
+ShowCursor PROC
+    mov  cursorInfo.bVisible, 1
+    INVOKE SetConsoleCursorInfo, hOut, ADDR cursorInfo
+    ret
+ShowCursor ENDP
+
+; ============================================================
+;  MENU SCREENS
+; ============================================================
+
+; ShowTitle : EAX = 1 play, 2 leaderboard, 0 exit
+ShowTitle PROC
+TitleDraw:
+    call NewScreen
+    mov  eax, lightCyan
+    call SetTextColor
+    mov  dh, 4
+    mov  dl, 25
+    call GotoXYo
+    mov  edx, OFFSET msgT1
+    call WriteString
+    mov  eax, yellow
+    call SetTextColor
+    mov  dh, 5
+    mov  dl, 25
+    call GotoXYo
+    mov  edx, OFFSET msgT2
+    call WriteString
+    mov  eax, lightCyan
+    call SetTextColor
+    mov  dh, 6
+    mov  dl, 25
+    call GotoXYo
+    mov  edx, OFFSET msgT1
+    call WriteString
+    mov  eax, lightGray
+    call SetTextColor
+    mov  dh, 9
+    mov  dl, 20
+    call GotoXYo
+    mov  edx, OFFSET msgI1
+    call WriteString
+    mov  eax, lightGray
+    call SetTextColor
+    mov  dh, 10
+    mov  dl, 20
+    call GotoXYo
+    mov  edx, OFFSET msgI2
+    call WriteString
+    mov  eax, lightGray
+    call SetTextColor
+    mov  dh, 11
+    mov  dl, 20
+    call GotoXYo
+    mov  edx, OFFSET msgI3
+    call WriteString
+    mov  eax, lightGreen
+    call SetTextColor
+    mov  dh, 14
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgM1
+    call WriteString
+    mov  eax, yellow
+    call SetTextColor
+    mov  dh, 15
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgM2
+    call WriteString
+    mov  eax, lightRed
+    call SetTextColor
+    mov  dh, 16
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgM3
+    call WriteString
+TitleKey:
+    call WaitKey
+    cmp  eax, -1
+    je   TitleDraw              ; window resized
+    mov  edx, 1
+    cmp  al, 0Dh                ; ENTER
+    je   TitleOut
+    mov  edx, 2
+    cmp  al, 'L'
+    je   TitleOut
+    xor  edx, edx
+    cmp  al, 1Bh                ; ESC
+    jne  TitleKey
+TitleOut:
+    mov  eax, edx
+    ret
+ShowTitle ENDP
+
+; AskName : read the player's name (empty = "PLAYER")
+AskName PROC
+    mov  lastRank, -1
+    call NewScreen
+    mov  eax, yellow
+    call SetTextColor
+    mov  dh, 8
+    mov  dl, 22
+    call GotoXYo
+    mov  edx, OFFSET msgAskName
+    call WriteString
+    cld                         ; clear the buffer (REP STOSB)
+    mov  edi, OFFSET playerName
+    mov  ecx, NAME_SLOT
+    xor  al, al
+    rep  stosb
+    mov  eax, white
+    call SetTextColor
+    call ShowCursor
+    mov  dh, 10
+    mov  dl, 33
+    call GotoXYo
+    mov  edx, OFFSET playerName
+    mov  ecx, NAME_MAX
+    call ReadString             ; EAX = characters typed
+    call HideCursor
+    test eax, eax
+    jnz  NameOk
+    mov  esi, OFFSET defaultName ; nothing typed: copy "PLAYER"
+    mov  edi, OFFSET playerName
+    mov  ecx, 7
+    rep  movsb
+NameOk:
+    ret
+AskName ENDP
+
+; SelectDifficulty : keys 1 / 2 / 3
+SelectDifficulty PROC
+DiffDraw:
+    call NewScreen
+    mov  eax, yellow
+    call SetTextColor
+    mov  dh, 4
+    mov  dl, 31
+    call GotoXYo
+    mov  edx, OFFSET msgDiffTitle
+    call WriteString
+    mov  eax, lightGreen
+    call SetTextColor
+    mov  dh, 8
+    mov  dl, 11
+    call GotoXYo
+    mov  edx, OFFSET msgEasy
+    call WriteString
+    mov  eax, yellow
+    call SetTextColor
+    mov  dh, 10
+    mov  dl, 11
+    call GotoXYo
+    mov  edx, OFFSET msgMed
+    call WriteString
+    mov  eax, lightRed
+    call SetTextColor
+    mov  dh, 12
+    mov  dl, 11
+    call GotoXYo
+    mov  edx, OFFSET msgHard
+    call WriteString
+    mov  eax, lightGray
+    call SetTextColor
+    mov  dh, 16
+    mov  dl, 33
+    call GotoXYo
+    mov  edx, OFFSET msgPick
+    call WriteString
+DiffKey:
+    call WaitKey
+    cmp  eax, -1
+    je   DiffDraw
+    sub  eax, '1'               ; '1'..'3' -> 0..2
+    cmp  eax, 2
+    ja   DiffKey                ; unsigned: any other key is ignored
+    mov  difficulty, eax
+    ret
+SelectDifficulty ENDP
+
+; ShowLeaderboard : from the main menu (R = reset)
+ShowLeaderboard PROC
+    mov  lastRank, -1
+LBDraw:
+    call NewScreen
+    mov  lbTop, 6
+    call DrawLeaderboard
+    mov  eax, white
+    call SetTextColor
+    mov  dh, 16
+    mov  dl, 26
+    call GotoXYo
+    mov  edx, OFFSET msgAnyKey
+    call WriteString
+    mov  eax, lightGray
+    call SetTextColor
+    mov  dh, 17
+    mov  dl, 24
+    call GotoXYo
+    mov  edx, OFFSET msgReset
+    call WriteString
+    call WaitKey
+    cmp  eax, -1
+    je   LBDraw
+    cmp  al, 'R'
+    jne  LBExit
+    mov  eax, lightRed
+    call SetTextColor
+    mov  dh, 19
+    mov  dl, 14
+    call GotoXYo
+    mov  edx, OFFSET msgConfirm
+    call WriteString
+    call WaitKey
+    cmp  al, 'Y'
+    jne  LBDraw                 ; cancelled (or resized)
+    call ResetLeaderboard
+    jmp  LBDraw
+LBExit:
+    ret
+ShowLeaderboard ENDP
+
+; DrawLeaderboard : table below canvas row [lbTop]
+DrawLeaderboard PROC
+    mov  eax, yellow
+    call SetTextColor
+    mov  eax, lbTop
+    mov  dh, al
+    mov  dl, 26
+    call GotoXYo
+    mov  edx, OFFSET msgLBTitle
+    call WriteString
+
+    xor  esi, esi               ; rank index 0..4
+LBRow:
+    mov  eax, lightCyan         ; gold for #1, green for the latest game
+    test esi, esi
+    jnz  NotFirst
+    mov  eax, yellow
+NotFirst:
+    cmp  esi, lastRank
+    jne  NotMine
+    mov  eax, lightGreen
+NotMine:
+    call SetTextColor
+
+    lea  edi, [esi + 2]         ; screen row of this entry
+    add  edi, lbTop
+    mov  eax, edi
+    mov  dh, al
+    mov  dl, 24
+    call GotoXYo
+    lea  eax, [esi + 1]
+    call WriteDec
+    mov  al, '.'
+    call WriteChar
+
+    mov  eax, edi
+    mov  dh, al
+    mov  dl, 28
+    call GotoXYo
+    cmp  lbScores[esi*4], 0
+    je   EmptySlot
+    mov  edx, OFFSET lbNames    ; name = lbNames + rank * 13
+    mov  eax, esi
+    imul eax, NAME_SLOT
+    add  edx, eax
+    call WriteString
+    mov  eax, edi
+    mov  dh, al
+    mov  dl, 46
+    call GotoXYo
+    mov  eax, lbScores[esi*4]
+    call WriteDec
+    jmp  NextLBRow
+EmptySlot:
+    mov  edx, OFFSET msgDash
+    call WriteString
+NextLBRow:
+    inc  esi
+    cmp  esi, LB_COUNT
+    jb   LBRow
+    ret
+DrawLeaderboard ENDP
+
+; ============================================================
+;  LEADERBOARD FILE
+; ============================================================
+
+LoadLeaderboard PROC
+    mov  edx, OFFSET lbFile
+    call OpenInputFile          ; EAX = handle
+    cmp  eax, INVALID_HANDLE_VALUE
+    je   LoadDone
+    mov  fileHandle, eax
+    mov  edx, OFFSET lbData
+    mov  ecx, LB_BYTES
+    call ReadFromFile
+    jnc  ReadOk
+    call ClearLeaderboard       ; read error: empty table
+ReadOk:
+    mov  eax, fileHandle
+    call CloseFile
+    xor  esi, esi               ; every name must end with 0
+SanLoop:
+    mov  eax, esi
+    imul eax, NAME_SLOT
+    mov  lbNames[eax + NAME_SLOT - 1], 0
+    inc  esi
+    cmp  esi, LB_COUNT
+    jb   SanLoop
+LoadDone:
+    ret
+LoadLeaderboard ENDP
+
+SaveLeaderboard PROC
+    mov  edx, OFFSET lbFile
+    call CreateOutputFile
+    cmp  eax, INVALID_HANDLE_VALUE
+    je   SaveDone
+    mov  fileHandle, eax
+    mov  edx, OFFSET lbData
+    mov  ecx, LB_BYTES
+    call WriteToFile
+    mov  eax, fileHandle
+    call CloseFile
+SaveDone:
+    ret
+SaveLeaderboard ENDP
+
+; ClearLeaderboard : zero all names and scores (REP STOSB)
+ClearLeaderboard PROC
+    cld
+    mov  edi, OFFSET lbData
+    mov  ecx, LB_BYTES
+    xor  al, al
+    rep  stosb
+    ret
+ClearLeaderboard ENDP
+
+; ResetLeaderboard : wipe all scores and save the empty table
+ResetLeaderboard PROC
+    call ClearLeaderboard
+    mov  lastRank, -1
+    call SaveLeaderboard
+    ret
+ResetLeaderboard ENDP
+
+; InsertScore : put (playerName, score) in the table if it ranks
+InsertScore PROC
+    mov  lastRank, -1
+    xor  esi, esi
+FindRank:
+    cmp  esi, LB_COUNT
+    jae  NotRanked
+    mov  eax, score
+    cmp  eax, lbScores[esi*4]
+    ja   RankFound
+    inc  esi
+    jmp  FindRank
+NotRanked:
+    ret
+
+RankFound:                      ; ESI = new rank (0..4)
+    mov  lastRank, esi
+    mov  ebx, LB_COUNT - 1      ; shift lower entries down by one
+ShiftLoop:
+    cmp  ebx, esi
+    jbe  ShiftDone
+    mov  eax, ebx
+    dec  eax                    ; source slot = ebx - 1
+    mov  edx, lbScores[eax*4]
+    mov  lbScores[ebx*4], edx   ; move the score
+    imul eax, NAME_SLOT         ; move the name
+    push esi
+    mov  esi, OFFSET lbNames
+    add  esi, eax
+    mov  edi, OFFSET lbNames
+    mov  eax, ebx
+    imul eax, NAME_SLOT
+    add  edi, eax
+    mov  ecx, NAME_SLOT
+    cld
+    rep  movsb
+    pop  esi
+    dec  ebx
+    jmp  ShiftLoop
+
+ShiftDone:
+    mov  eax, score
+    mov  lbScores[esi*4], eax   ; store score + name in the free slot
+    mov  edi, OFFSET lbNames
+    mov  eax, esi
+    imul eax, NAME_SLOT
+    add  edi, eax
+    mov  esi, OFFSET playerName
+    mov  ecx, NAME_SLOT
+    cld
+    rep  movsb
+    call SaveLeaderboard
+    ret
+InsertScore ENDP
+
+; ============================================================
+;  GAME SETUP
+; ============================================================
+
+; NewGame : reset score / lives / paddle / level, start level 1
+NewGame PROC
+    mov  score, 0
+    mov  level, 1
+    mov  gameState, 0
+    mov  lastRank, -1
+    mov  eax, difficulty
+    mov  ebx, diffLives[eax*4]
+    mov  lives, ebx
+    mov  ebx, diffPaddle[eax*4]
+    mov  paddleW, ebx
+    call StartLevel
+    ret
+NewGame ENDP
+
+; StartLevel : speed, paddle, brick layout, then show the screen
+StartLevel PROC
+    mov  eax, level             ; speed = difficulty base - 10 ms per level
+    dec  eax
+    imul eax, LEVEL_STEP
+    mov  ebx, difficulty
+    mov  ebx, diffDelay[ebx*4]
+    sub  ebx, eax
+    mov  frameDelay, ebx
+
+    mov  eax, RIGHT_X - LEFT_X + 1   ; centre the paddle
+    sub  eax, paddleW
+    shr  eax, 1
+    add  eax, LEFT_X
+    mov  paddleX, eax
+
+    mov  eax, level             ; copy this level's layout (REP MOVSB)
+    dec  eax
+    imul eax, TOTAL_BRICKS
+    cld
+    mov  esi, OFFSET layouts
+    add  esi, eax
+    mov  edi, OFFSET bricks
+    mov  ecx, TOTAL_BRICKS
+    rep  movsb
+
+    mov  ecx, TOTAL_BRICKS      ; count the bricks of this layout
+    xor  eax, eax
+    xor  esi, esi
+CountLoop:
+    movzx ebx, bricks[esi]
+    add  eax, ebx
+    inc  esi
+    loop CountLoop
+    mov  bricksLeft, eax
+
+    call ResetBall
+Prompt:
+    call RedrawScene
+    mov  eax, white
+    call SetTextColor
+    mov  dh, 12
+    mov  dl, 34
+    call GotoXYo
+    mov  edx, OFFSET msgLevelNo
+    call WriteString
+    mov  eax, level
+    call WriteDec
+    mov  eax, white
+    call SetTextColor
+    mov  dh, 13
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgLaunch
+    call WriteString
+    call WaitKey
+    cmp  eax, -1
+    je   Prompt                 ; window resized: redraw
+    mov  eax, white
+    call SetTextColor
+    mov  dh, 12
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgBlank
+    call WriteString
+    mov  eax, white
+    call SetTextColor
+    mov  dh, 13
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgBlank
+    call WriteString
+    ret
+StartLevel ENDP
+
+; LevelCleared : bonus, message, next level
+LevelCleared PROC
+    mov  eax, LEVEL_BONUS       ; bonus x difficulty multiplier
+    mov  ebx, difficulty
+    mul  diffMult[ebx*4]
+    mov  lastBonus, eax
+    add  score, eax
+    inc  level
+CLDraw:
+    call NewScreen
+    mov  eax, lightGreen
+    call SetTextColor
+    mov  dh, 8
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgCleared
+    call WriteString
+    mov  eax, white
+    call SetTextColor
+    mov  dh, 10
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgBonus
+    call WriteString
+    mov  eax, lastBonus
+    call WriteDec
+    mov  edx, OFFSET msgPoints
+    call WriteString
+    mov  eax, yellow
+    call SetTextColor
+    mov  dh, 12
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgScoreLbl
+    call WriteString
+    mov  eax, score
+    call WriteDec
+    mov  eax, lightGray
+    call SetTextColor
+    mov  dh, 15
+    mov  dl, 22
+    call GotoXYo
+    mov  edx, OFFSET msgNext
+    call WriteString
+    call WaitKey
+    cmp  eax, -1
+    je   CLDraw
+    mov  gameState, 0
+    call StartLevel
+    ret
+LevelCleared ENDP
+
+; ============================================================
+;  DRAWING
+; ============================================================
+
+; VLine : vertical border line, DL = canvas column, rows 2..24
+VLine PROC
+    mov  dh, TOP_Y
+VLoop:
+    call GotoXYo
+    mov  al, 0DBh
+    call WriteChar
+    inc  dh
+    cmp  dh, 24
+    jbe  VLoop
+    ret
+VLine ENDP
+
+; DrawFrame : top / left / right borders (bottom is open)
+DrawFrame PROC
+    mov  eax, level
+    dec  eax
+    movzx eax, frameColors[eax] ; border colour of this level
+    call SetTextColor
+    mov  dh, 1
+    mov  dl, LEFT_X - 1
+    call GotoXYo
+    mov  ecx, RIGHT_X - LEFT_X + 3
+TopLoop:
+    mov  al, 0DBh
+    call WriteChar
+    loop TopLoop
+    mov  dl, LEFT_X - 1
+    call VLine
+    mov  dl, RIGHT_X + 1
+    call VLine
+    ret
+DrawFrame ENDP
+
+; DrawBricks : draw every brick that is still alive
+DrawBricks PROC
+    mov  bl, 0DBh
+    xor  esi, esi               ; row
+BRowLoop:
+    xor  edi, edi               ; column
+BColLoop:
+    imul eax, esi, BRICK_COLS   ; index = row * 12 + col
+    add  eax, edi
+    cmp  bricks[eax], 0
+    je   BSkip
+    call PaintBrick
+BSkip:
+    inc  edi
+    cmp  edi, BRICK_COLS
+    jb   BColLoop
+    inc  esi
+    cmp  esi, BRICK_ROWS
+    jb   BRowLoop
+    ret
+DrawBricks ENDP
+
+; PaintBrick : ESI = row, EDI = column, BL = char (0DBh draw, ' ' erase)
+PaintBrick PROC
+    push eax
+    push ecx
+    push edx
+    mov  eax, level             ; colour = levelColors[(level-1)*4 + row]
+    dec  eax
+    shl  eax, 2
+    add  eax, esi
+    movzx eax, levelColors[eax]
+    call SetTextColor
+    mov  eax, edi
+    imul eax, BRICK_W
+    add  eax, LEFT_X
+    mov  dl, al
+    lea  eax, [esi + BRICK_TOP]
+    mov  dh, al
+    call GotoXYo
+    mov  ecx, BRICK_W - 1       ; 4 blocks, 5th cell is the gap
+PBLoop:
+    mov  al, bl
+    call WriteChar
+    loop PBLoop
+    pop  edx
+    pop  ecx
+    pop  eax
+    ret
+PaintBrick ENDP
+
+; PaintPaddle : BL = 0DBh to draw, ' ' to erase
+PaintPaddle PROC
+    mov  eax, lightCyan
+    call SetTextColor
+    mov  dh, PADDLE_Y
+    mov  dl, BYTE PTR paddleX
+    call GotoXYo
+    mov  ecx, paddleW
+PPLoop:
+    mov  al, bl
+    call WriteChar
+    loop PPLoop
+    ret
+PaintPaddle ENDP
+
+; PaintBall : BL = 'O' to draw, ' ' to erase
+PaintBall PROC
+    mov  eax, white
+    call SetTextColor
+    mov  dh, BYTE PTR ballY
+    mov  dl, BYTE PTR ballX
+    call GotoXYo
+    mov  al, bl
+    call WriteChar
+    ret
+PaintBall ENDP
+
+; ResetBall : ball above the paddle centre, random left/right
+ResetBall PROC
+    mov  eax, paddleW
+    shr  eax, 1
+    add  eax, paddleX
+    mov  ballX, eax
+    mov  ballY, PADDLE_Y - 1
+    mov  ballDY, -1
+    mov  eax, 2
+    call RandomRange            ; 0 or 1
+    add  eax, eax
+    dec  eax                    ; -1 or +1
+    mov  ballDX, eax
+    ret
+ResetBall ENDP
+
+; DrawHUD : name, level, score, lives, bricks, difficulty (row 0)
+DrawHUD PROC
+    mov  dh, 0
+    mov  dl, LEFT_X - 1
+    call GotoXYo
+    mov  eax, white
+    call SetTextColor
+    mov  edx, OFFSET playerName
+    call WriteString
+    mov  eax, lightCyan
+    call SetTextColor
+    mov  edx, OFFSET msgHudLv
+    call WriteString
+    mov  eax, level
+    call WriteDec
+    mov  eax, yellow
+    call SetTextColor
+    mov  edx, OFFSET msgHudSc
+    call WriteString
+    mov  eax, score
+    call WriteDec
+    mov  eax, lightRed
+    call SetTextColor
+    mov  edx, OFFSET msgHudLi
+    call WriteString
+    mov  eax, lives
+    call WriteDec
+    mov  eax, lightGreen
+    call SetTextColor
+    mov  edx, OFFSET msgHudBr
+    call WriteString
+    mov  eax, bricksLeft
+    call WriteDec
+    mov  eax, difficulty        ; difficulty tag in its own colour
+    movzx eax, diffColors[eax]
+    call SetTextColor
+    mov  edx, OFFSET msgHudDf
+    call WriteString
+    mov  eax, difficulty
+    mov  edx, diffNameTbl[eax*4]
+    call WriteString
+    mov  edx, OFFSET msgTail
+    call WriteString                ; overwrite leftover characters
+    ret
+DrawHUD ENDP
+
+; ============================================================
+;  GAMEPLAY
+; ============================================================
+
+; HandleInput : non-blocking keyboard read (uses the LAST key in the buffer)
+HandleInput PROC
+    mov  keyVK, 0
+ReadLoop:
+    call ReadKey                ; ZF = 1 when no key waiting
+    jz   ReadDone
+    mov  keyVK, dx              ; DX = virtual-key code
+    jmp  ReadLoop
+ReadDone:
+    movzx eax, keyVK
+    mov  esi, -PADDLE_STEP
+    cmp  eax, KEY_LEFT
+    je   MovePaddle
+    cmp  eax, KEY_A
+    je   MovePaddle
+    mov  esi, PADDLE_STEP
+    cmp  eax, KEY_RIGHT
+    je   MovePaddle
+    cmp  eax, KEY_D
+    je   MovePaddle
+    cmp  eax, KEY_ESC
+    jne  InputDone
+    mov  gameState, 3           ; quit
+InputDone:
+    ret
+
+MovePaddle:                     ; ESI = step (-2 or +2)
+    mov  bl, ' '
+    call PaintPaddle            ; erase at the old position
+    mov  eax, paddleX
+    add  eax, esi
+    cmp  eax, LEFT_X
+    jge  NotLeft
+    mov  eax, LEFT_X            ; clamp at the left wall
+NotLeft:
+    mov  ecx, RIGHT_X + 1
+    sub  ecx, paddleW           ; rightmost allowed position
+    cmp  eax, ecx
+    jle  NotRight
+    mov  eax, ecx               ; clamp at the right wall
+NotRight:
+    mov  paddleX, eax
+    mov  bl, 0DBh
+    call PaintPaddle
+    ret
+HandleInput ENDP
+
+; MoveBall : one step + collisions
+;   1 side walls  2 top wall  3 bricks  4 paddle  5 pit (lose a life)
+MoveBall PROC
+    mov  bl, ' '
+    call PaintBall              ; erase the ball
+
+    mov  eax, ballX             ; candidate position
+    add  eax, ballDX
+    mov  newX, eax
+    mov  eax, ballY
+    add  eax, ballDY
+    mov  newY, eax
+
+    cmp  newX, LEFT_X           ; ---- 1. side walls
+    jl   BounceX
+    cmp  newX, RIGHT_X
+    jle  CheckTop
+BounceX:
+    neg  ballDX
+    mov  eax, ballX
+    add  eax, ballDX
+    mov  newX, eax
+
+CheckTop:                       ; ---- 2. top wall
+    cmp  newY, TOP_Y
+    jge  CheckBrick
+    neg  ballDY
+    mov  eax, ballY
+    add  eax, ballDY
+    mov  newY, eax
+
+CheckBrick:                     ; ---- 3. bricks
+    mov  eax, newY
+    sub  eax, BRICK_TOP
+    jl   CheckPaddle            ; above the brick area
+    cmp  eax, BRICK_ROWS
+    jge  CheckPaddle            ; below the brick area
+    mov  esi, eax               ; ESI = brick row
+    mov  eax, newX
+    sub  eax, LEFT_X
+    xor  edx, edx
+    mov  ebx, BRICK_W
+    div  ebx
+    mov  edi, eax               ; EDI = brick column
+    imul eax, esi, BRICK_COLS
+    add  eax, edi               ; EAX = index in bricks[]
+    cmp  bricks[eax], 0
+    je   CheckPaddle            ; empty cell
+
+    mov  bricks[eax], 0         ; hit: erase the brick
+    mov  bl, ' '
+    call PaintBrick
+    mov  eax, BRICK_ROWS        ; points = (4 - row) * 10 * multiplier
+    sub  eax, esi
+    imul eax, 10
+    mov  ebx, difficulty
+    mul  diffMult[ebx*4]
+    add  score, eax
+
+    cmp  frameDelay, MIN_DELAY  ; speed up a little
+    jbe  NoSpeedUp
+    dec  frameDelay
+NoSpeedUp:
+    dec  bricksLeft
+    jnz  BrickBounce
+    mov  gameState, 4           ; level cleared
+    cmp  level, MAX_LEVEL
+    jb   BrickBounce
+    mov  gameState, 2           ; last level cleared = game won
+BrickBounce:
+    neg  ballDY
+    jmp  StayPut
+
+CheckPaddle:                    ; ---- 4. paddle
+    cmp  newY, PADDLE_Y
+    jne  CheckBottom
+    cmp  ballDY, 0
+    jle  CheckBottom            ; only when moving down
+    mov  eax, newX
+    sub  eax, paddleX           ; hit offset on the paddle
+    jl   CheckBottom
+    cmp  eax, paddleW
+    jge  CheckBottom
+    mov  ballDY, -1             ; bounce up
+    imul ecx, eax, 3            ; offset * 3 decides the third hit
+    mov  ebx, paddleW
+    cmp  ecx, ebx
+    jl   HitLeft                ; left third  -> go left
+    shl  ebx, 1
+    cmp  ecx, ebx
+    jl   StayPut                ; middle third -> keep direction
+    mov  ballDX, 1              ; right third -> go right
+    jmp  StayPut
+HitLeft:
+    mov  ballDX, -1
+    jmp  StayPut
+
+CheckBottom:                    ; ---- 5. ball fell past the paddle
+    cmp  newY, PADDLE_Y
+    jle  Finish
+    dec  lives
+    jnz  StillAlive
+    mov  gameState, 1           ; no lives left
+    ret
+StillAlive:
+    mov  eax, 800
+    call Delay                  ; short pause
+Drain:
+    call ReadKey                ; flush key presses
+    jnz  Drain
+    call ResetBall
+    mov  bl, 'O'
+    call PaintBall
+    ret
+
+StayPut:                        ; bounce frame: ball does not move
+    mov  eax, ballX
+    mov  newX, eax
+    mov  eax, ballY
+    mov  newY, eax
+Finish:
+    mov  eax, newX
+    mov  ballX, eax
+    mov  eax, newY
+    mov  ballY, eax
+    mov  bl, 'O'
+    call PaintBall
+    ret
+MoveBall ENDP
+
+; ============================================================
+; ShowEndScreen : result + leaderboard
+;   EAX = 1 play again, 2 main menu, 3 change difficulty
+; ============================================================
+ShowEndScreen PROC
+    call InsertScore            ; update + save the leaderboard
+EndDraw:
+    call NewScreen
+    mov  ebx, gameState
+    dec  ebx                    ; 0 lost, 1 won, 2 quit
+    movzx eax, endColors[ebx]
+    call SetTextColor
+    mov  dh, 3
+    mov  dl, 24
+    call GotoXYo
+    mov  edx, endMsgTbl[ebx*4]
+    call WriteString
+
+    mov  eax, white
+    call SetTextColor
+    mov  dh, 5
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgPlayer
+    call WriteString
+    mov  edx, OFFSET playerName
+    call WriteString
+    mov  eax, white
+    call SetTextColor
+    mov  dh, 6
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgFinal
+    call WriteString
+    mov  eax, score
+    call WriteDec
+    mov  eax, difficulty
+    movzx eax, diffColors[eax]
+    call SetTextColor
+    mov  dh, 8
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgDiffLbl
+    call WriteString
+    mov  eax, difficulty
+    mov  edx, diffNameTbl[eax*4]
+    call WriteString
+    cmp  lastRank, 0
+    jl   NoHigh
+    mov  eax, lightGreen
+    call SetTextColor
+    mov  dh, 7
+    mov  dl, 28
+    call GotoXYo
+    mov  edx, OFFSET msgHigh
+    call WriteString
+NoHigh:
+    mov  lbTop, 10
+    call DrawLeaderboard
+    mov  eax, white
+    call SetTextColor
+    mov  dh, 19
+    mov  dl, 12
+    call GotoXYo
+    mov  edx, OFFSET msgAgain
+    call WriteString
+
+EndKey:
+    call WaitKey
+    cmp  eax, -1
+    je   EndDraw                ; window resized
+    mov  edx, 1
+    cmp  al, 'Y'
+    je   EndOut
+    inc  edx                    ; 2 = main menu
+    cmp  al, 'N'
+    je   EndOut
+    inc  edx                    ; 3 = change difficulty
+    cmp  al, 'D'
+    jne  EndKey
+EndOut:
+    mov  eax, edx
+    ret
+ShowEndScreen ENDP
+
+END main
